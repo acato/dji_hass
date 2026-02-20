@@ -320,18 +320,116 @@ Mavic 2 LiPo batteries degrade quickly when stored at high charge. They self-dis
 | Telemetry | `FlightControllerState` | 10 Hz: GPS, altitude, velocity, heading, flight mode, motors, wind |
 | Battery | `Battery` | Charge %, voltage, current, temp, cycles, remaining mAh |
 | Signal Strength | `AirLink` | Uplink/downlink quality |
-| Live Video | `VideoFeeder` + `LiveStreamManager` | H.264 RTMP push (720p, 1-5 Mbps) |
+| Live Video | `VideoFeeder` + `LiveStreamManager` | See Section 6.4 — Video Pipeline |
 | Media Download | `MediaManager` | Download photos/videos from SD card |
 
 ### 6.3 What's NOT Available
 
-- **No RTSP** — only in MSDK v5 (doesn't support Mavic 2)
+- **No RTSP from the drone** — RTSP is only in MSDK v5 (doesn't support Mavic 2)
+- **No RTMP from the drone** — the aircraft transmits proprietary DJI video, not any standard protocol
 - **No server-side control** — always requires Android/iOS/Windows intermediary
 - **No headless SDK** — DJI SDK requires a UI context on Android (workarounds exist)
 - **99-waypoint limit** — flight controller hardware constraint
 - **Live feed is 720p** — not the 4K recording resolution
 - **No in-aircraft battery charging** — no USB/auxiliary charge path exists
 - **No auto-launch** — motors must be armed via controller/app
+
+### 6.4 Video Pipeline (Important — The Drone Does NOT Speak RTMP)
+
+The Mavic 2 does **not** output RTMP, RTSP, or any standard streaming protocol. The video path has four stages, and the protocol translation happens entirely on the Android bridge device:
+
+```
+Stage 1: Aircraft → Remote Controller
+  Protocol: OcuSync 2.0 (proprietary DJI RF link, 2.4/5.8 GHz)
+  Codec: DJI-proprietary H.264 encoding
+  This is a radio link — no IP networking involved.
+
+Stage 2: Remote Controller → Android Bridge
+  Protocol: USB (proprietary DJI data channel)
+  The RC passes raw video bytes over USB to the connected device.
+  No standard video protocol here either.
+
+Stage 3: DJI SDK Decoding (on Android device)
+  The SDK's VideoFeeder delivers raw H.264 NAL units via callback.
+  DJICodecManager decodes DJI's proprietary framing into standard H.264.
+  This happens in the bridge app's process on the Android device.
+
+Stage 4: RTMP Re-encode and Push (on Android device)
+  The SDK's LiveStreamManager takes the decoded video, re-encodes it
+  to standard H.264, and pushes it over RTMP to a URL you configure.
+  THIS is where RTMP first appears — on the Android device, not the drone.
+```
+
+**The complete video flow:**
+
+```
+Mavic 2 Camera
+  │ records 4K to SD card (independent of live stream)
+  │
+  │ DJI proprietary H.264
+  ▼
+OcuSync 2.0 radio link (2.4/5.8 GHz)
+  │
+  ▼
+DJI Remote Controller
+  │
+  │ USB (proprietary data channel)
+  ▼
+Android Bridge Device
+  │
+  ├── DJI SDK VideoFeeder receives raw H.264 NAL units
+  │     │
+  │     ▼
+  ├── DJI SDK LiveStreamManager
+  │     ├── Re-encodes to standard H.264
+  │     ├── Wraps in RTMP
+  │     └── Pushes to configured URL
+  │           │
+  │           │ RTMP over WiFi (first standard protocol in the chain)
+  │           ▼
+  │     Media Server (go2rtc / mediamtx on HA)
+  │           ├── Receives RTMP
+  │           ├── Can re-serve as WebRTC, HLS, or RTSP
+  │           └── HA camera entity consumes the stream
+  │
+  └── Alternative: VideoFeeder raw callback
+        ├── Custom code can intercept raw H.264 NAL units
+        ├── Forward via RTP/UDP (as RosettaDrone does)
+        └── Pipe to FFmpeg for any format conversion
+```
+
+**LiveStreamManager API (on the Android bridge):**
+
+```kotlin
+// Configure RTMP destination
+val liveStreamManager = DJISDKManager.getInstance().liveStreamManager
+liveStreamManager.setLiveUrl("rtmp://192.168.1.10:1935/live/mavic2")
+
+// Start pushing
+liveStreamManager.startStream()
+// Now the media server receives standard H.264 over RTMP
+
+// Stop
+liveStreamManager.stopStream()
+```
+
+**Live stream specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Protocol (to media server) | RTMP (originated by Android bridge, NOT the drone) |
+| Codec | H.264 |
+| Resolution | 720p max |
+| Bitrate (Android) | 3-5 Mbps configurable |
+| Bitrate (iOS) | 1-2 Mbps |
+| Audio | Optional (Android device microphone, not drone) |
+| Latency | ~200-500ms (OcuSync) + ~100-300ms (RTMP encoding) |
+| 4K recording | Independent — records to SD card regardless of live stream |
+
+**Two independent video paths exist simultaneously:**
+
+1. **Live stream (720p)** — viewable in real-time via HA camera entity. Goes through the full pipeline above. Used for live monitoring during missions.
+2. **SD card recording (up to 4K)** — recorded by the drone's camera independently. Must be retrieved after the flight via DJI SDK `MediaManager` or by physically removing the SD card. This is the evidence-quality footage.
 
 ---
 
@@ -357,47 +455,67 @@ Mavic 2 LiPo batteries degrade quickly when stored at high charge. They self-dis
 │             │              │               │                  │   │
 │  ┌──────────┴───────────┐  │  Sensors │ Binary │ Camera │ DT  │   │
 │  │  Mosquitto Broker    │◄─┤──────────────────────────────────┤   │
-│  └──────────┬───────────┘  └──────────────────────────────────┘   │
-│             │                                                     │
-│  ┌──────────┴───────────┐                                        │
-│  │  Media Server         │  (go2rtc / mediamtx)                   │
-│  │  RTMP in → WebRTC out │                                        │
-│  └──────────────────────┘                                        │
-└────────────┬──────────────────────────────────────────┬──────────┘
-             │ MQTT (tcp/1883)                          │ RTMP (tcp/1935)
-             │ LAN / WiFi                               │
-┌────────────┴──────────────────────────────────────────┴──────────┐
-│                     ANDROID BRIDGE APP                             │
-│                     (dedicated Android device + RC)                │
-│                                                                   │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │                   DJI Mobile SDK v4                       │    │
-│  │  FlightController │ Camera/Gimbal │ LiveStreamManager     │    │
-│  └──────────┬────────────────┬───────────────┬──────────────┘    │
-│             │                │               │                    │
-│  ┌──────────┴────────────────┴───────────────┴──────────────┐    │
-│  │                 MQTT Service Layer                         │    │
-│  │  - Telemetry publish (10 Hz → 1 Hz configurable)          │    │
-│  │  - Command subscribe + execute + respond                   │    │
-│  │  - Mission cache + translate JSON → DJIWaypointMission     │    │
-│  │  - RTMP push to media server                               │    │
-│  │  - LWT: "offline" on disconnect                            │    │
-│  └──────────────────────────┬───────────────────────────────┘    │
-│                              │ USB                                │
+│  └──────────┬───────────┘  └────────────────────┬─────────────┘   │
+│             │                                    │                 │
+│  ┌──────────┴───────────┐              ┌────────┴──────────┐     │
+│  │                      │              │ camera.mavic2_live │     │
+│  │  Media Server        │◄─────────────┤ consumes stream   │     │
+│  │  (go2rtc / mediamtx) │  WebRTC/HLS  │ from media server │     │
+│  │                      │              └───────────────────┘     │
+│  └──────────┬───────────┘                                        │
+│             │ ▲ Receives RTMP                                     │
+└─────────────┤─┤──────────────────────────────────────────────────┘
+              │ │                          RTMP is generated HERE,
+              │ │                          on the Android device —
+              │ │                          NOT by the drone
+              │ │
+┌─────────────┤─┤──────────────────────────────────────────────────┐
+│  ANDROID    │ │  BRIDGE APP                                       │
+│             │ │  (dedicated Android device + RC)                   │
+│             │ │                                                    │
+│  ┌──────────┴─┴──────────────────────────────────────────────┐   │
+│  │                   DJI Mobile SDK v4                        │   │
+│  │                                                            │   │
+│  │  ┌────────────────┐ ┌────────────┐ ┌───────────────────┐  │   │
+│  │  │ FlightControler│ │ Camera/    │ │ LiveStreamManager │  │   │
+│  │  │                │ │ Gimbal     │ │                   │  │   │
+│  │  │ Telemetry,     │ │ Photo,     │ │ Receives DJI      │  │   │
+│  │  │ commands,      │ │ record,    │ │ proprietary video │  │   │
+│  │  │ missions       │ │ settings   │ │ via VideoFeeder,  │  │   │
+│  │  │                │ │            │ │ re-encodes to     │  │   │
+│  │  │                │ │            │ │ H.264, pushes     │──┤──►│ RTMP out
+│  │  │                │ │            │ │ RTMP to media srv │  │   │ (WiFi)
+│  │  └───────┬────────┘ └─────┬──────┘ └──────────┬────────┘  │   │
+│  │          │                │                    │           │   │
+│  │  ┌───────┴────────────────┴────────────────────┴────────┐  │   │
+│  │  │              MQTT Service Layer                       │  │   │
+│  │  │  - Telemetry publish (10 Hz → 1 Hz)                   │  │   │
+│  │  │  - Command subscribe + execute + respond               │  │   │
+│  │  │  - Mission cache + translate JSON → DJIWaypointMission │  │   │
+│  │  │  - LWT: "offline" on disconnect                        │  │   │
+│  │  └───────────────────────┬────────────────────────────────┘  │   │
+│  └──────────────────────────┘                                    │   │
+│                              │ USB (proprietary DJI data)         │
 │                    ┌─────────┴─────────┐                         │
 │                    │  DJI Remote Ctrl   │                         │
 │                    └─────────┬─────────┘                         │
-│                              │ OcuSync 2.0                       │
+│                              │ OcuSync 2.0 (proprietary RF)      │
+│                              │ NOT RTMP, NOT RTSP, NOT IP        │
 │          ┌───────────────────┴───────────────────┐               │
 │          │            PHYSICAL DOCK               │               │
 │          │  ┌───────────────────────────────┐     │               │
 │          │  │  Mavic 2 Zoom (primary)       │     │               │
 │          │  │  or Mavic 2 Pro (secondary)   │     │               │
+│          │  │                               │     │               │
+│          │  │  Camera records 4K to SD card │     │               │
+│          │  │  (independent of live stream) │     │               │
 │          │  └───────────────────────────────┘     │               │
 │          │  ESPHome ESP32: lid, sensors, heater   │               │
 │          └────────────────────────────────────────┘               │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**Key point:** No standard video protocol exists anywhere in the chain until the Android bridge creates it. The drone speaks proprietary DJI encoding over proprietary OcuSync RF. The RC passes raw bytes over USB. The SDK decodes the proprietary format. Only then does `LiveStreamManager` produce RTMP — on the Android device — and push it over WiFi to the media server.
 
 ### 7.2 Component Responsibilities
 
@@ -413,7 +531,7 @@ Mavic 2 LiPo batteries degrade quickly when stored at high charge. They self-dis
 - DJI SDK registration and product connection lifecycle
 - Subscribe to MQTT command topics, execute DJI SDK calls, publish responses
 - Publish telemetry to MQTT (downsampled from 10 Hz to 1 Hz; burst 10 Hz during missions)
-- Push live video via RTMP to media server
+- **Video bridge:** receive proprietary DJI video via SDK `VideoFeeder`, re-encode via `LiveStreamManager`, and push standard H.264 RTMP to the media server (this is the ONLY place in the system where RTMP originates — the drone itself does not speak any standard streaming protocol)
 - Cache mission definitions from retained MQTT messages
 - Translate JSON mission format → `DJIMutableWaypointMission`
 - Validate missions against SDK constraints before upload
