@@ -802,17 +802,55 @@ automation:
 
 ## 12. Security Considerations
 
-| Concern | Mitigation |
-|---------|------------|
-| MQTT without TLS | Use MQTT over TLS (port 8883) in production |
-| Unauthorized drone commands | MQTT authentication. Bridge validates command source. |
-| Physical access to bridge device | Secure location. Android device encryption. |
-| DJI SDK credentials | Android Keystore, not in MQTT messages |
-| Drone flyaway | Bridge enforces geofence before mission upload. RTH on signal loss (DJI default). |
-| Battery safety | Bridge refuses mission below configurable threshold (default 30%). Dock smoke sensor. |
-| Network isolation | Dedicated VLAN/WiFi for bridge + HA |
-| Privacy (neighbors) | Missions avoid neighbor airspace. Camera angle constrained. |
-| Audit trail | HA logs: trigger, authorization timestamp, mission, outcome |
+See `.claude/security-pentester.md` for the full adversarial threat model, attack catalog, and pentesting checklist. Below is the summary of required mitigations, organized by severity.
+
+### Critical Mitigations (must-have before deployment)
+
+| Attack | Mitigation |
+|--------|------------|
+| **Unauthenticated MQTT** (ATK-MQTT-01) | MQTT authentication mandatory. TLS on port 8883. ACLs restrict publish to command topics to HA's client ID only. Bind to VLAN, not 0.0.0.0. |
+| **Command injection** (ATK-MQTT-02) | Bridge validates ALL missions: geofence (waypoints within property), altitude ceiling, speed limits, distance from home. Mission allowlist. |
+| **Unauthorized flight** (ATK-HA-01) | Bridge requires a time-limited, single-use authorization token before executing any flight command. Token issued only via validated pilot tap. |
+| **LiPo fire via dock** (ATK-DOCK-02) | Smoke sensor → hardware relay (not software) cuts charger power. ESP32 firmware enforces charge temperature limits independently of HA. Max-on timer for charger outlet in firmware. |
+| **Safety gate bypass** (ATK-HA-02) | Safety checks enforced in TWO places: HA automation (first line) AND bridge firmware (second line, not bypassable). |
+
+### High Mitigations (strongly recommended)
+
+| Attack | Mitigation |
+|--------|------------|
+| **WiFi deauth** (ATK-NET-01) | WPA3 with PMF. Dedicated VLAN. DJI RTH altitude above tree line. |
+| **RTMP interception** (ATK-NET-04) | Media server authentication (stream keys). Bind to localhost/VLAN. |
+| **Notification spoofing** (ATK-HA-03) | Authorization token architecture prevents fake events from triggering flights. |
+| **Dock lid during flight** (ATK-DOCK-03) | ESP32 interlock: refuse close unless pad-clear sensor confirms AND flight state = landed. |
+| **ESPHome takeover** (ATK-DOCK-04) | API encryption key + OTA password mandatory. |
+
+### Medium Mitigations
+
+| Attack | Mitigation |
+|--------|------------|
+| **Command replay** (ATK-MQTT-03) | Commands include timestamp, rejected if stale. Single-use correlation IDs. |
+| **Retained message poisoning** (ATK-MQTT-04) | Bridge validates mission checksums. MQTT ACLs restrict publish to state topics. |
+| **MQTT flood DoS** (ATK-MQTT-05) | Mosquitto rate limiting. Coordinator debounces. Network isolation. |
+| **Audit log tampering** (ATK-HA-04) | Append-only log destination. Bridge independently logs. |
+| **Aircraft theft** (ATK-DOCK-01) | Physical lock. Tamper sensor. DJI 2FA. Missions on bridge, not SD card. |
+
+### Accepted Residual Risk
+
+| Attack | Justification |
+|--------|---------------|
+| **GPS spoofing** (ATK-RF-02) | Requires specialized illegal equipment. DJI multi-constellation GNSS provides partial protection. Low probability for residential target. |
+| **OcuSync jamming** (ATK-RF-01) | Illegal (FCC violation). DJI failsafe (RTH) handles this. Drone still records to SD card. |
+| **Bridge device compromise** (ATK-NET-03) | Mitigated by VLAN isolation and disabled ADB. Accepted risk on isolated device. |
+
+### Defense-in-Depth Principle
+
+No single security control protects the system. The architecture enforces **three independent safety boundaries**:
+
+1. **HA layer** — automation conditions, notification workflow, audit logging
+2. **Bridge layer** — authorization token, geofence, altitude ceiling, battery threshold, mission allowlist
+3. **DJI firmware** — RTH failsafe, geofence, low-battery auto-land, obstacle avoidance
+
+An attacker must compromise all three layers to cause a dangerous unauthorized flight.
 
 ---
 
