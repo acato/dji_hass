@@ -3,19 +3,301 @@
 > **Role:** ARCHITECT
 > **Date:** 2026-02-19
 > **Status:** Proposal
-> **Version:** 0.2.0
-
-## 1. Executive Summary
-
-This document designs a Home Assistant integration for DJI Mavic 2 Pro/Zoom drones. The core challenge is that **no server-side/Linux SDK exists for Mavic 2** — all viable SDKs (Mobile SDK v4, Windows SDK) require a physical device connected via USB to the DJI Remote Controller.
-
-The architecture solves this with a **two-tier bridge pattern**: an Android app running DJI Mobile SDK v4 acts as a protocol bridge, exposing drone capabilities over MQTT and RTMP to a Home Assistant custom integration.
+> **Version:** 0.3.0
 
 ---
 
-## 2. DJI SDK Reality Check
+## 1. Executive Summary
 
-### What's Available for Mavic 2
+**dji_hass** is a Home Assistant integration that enables alarm-triggered aerial perimeter inspection using DJI Mavic 2 drones.
+
+The system implements **human-in-the-loop autonomy**: Home Assistant automates everything — alarm detection, safety checks, mission selection, dock preparation — but a Part 107 Remote Pilot in Command (RPIC) explicitly authorizes each flight with a single tap. This satisfies FAA requirements while delivering a functionally autonomous security drone response.
+
+Three subsystems work together:
+
+1. **Physical Dock** — weatherproof enclosure with ESPHome controller, keeps drone staged and batteries ready
+2. **Android Bridge** — dedicated Android device running DJI Mobile SDK v4, translating between DJI proprietary protocols and MQTT/RTMP
+3. **HA Integration** — `custom_components/dji_hass/`, orchestrating the entire workflow as native HA entities, services, and automations
+
+**Design constraint:** The Mavic 2 is Phase-0 hardware (aging platform, 2018). The dock and software are designed to be aircraft-agnostic so they survive a future drone upgrade.
+
+---
+
+## 2. Regulatory Framework
+
+### 2.1 Applicable Law
+
+Drone operation in the U.S. is governed by federal law (FAA), not state law. This use case — property security triggered by an alarm — is **commercial/operational**, meaning **14 CFR Part 107** applies (not recreational hobby rules).
+
+### 2.2 What Part 107 Requires
+
+| Requirement | Status |
+|-------------|--------|
+| FAA Part 107 certificate (RPIC) | Required |
+| FAA registration | Required |
+| Remote ID broadcast | Required (module or firmware) |
+| Anti-collision strobe for night ops | Required (visible 3 statute miles) |
+| Visual Line of Sight (VLOS) | Required (RPIC or visual observer must see drone) |
+| Fly under 400 ft AGL | Yes (missions at 80-120 ft) |
+| Unrestricted (Class G) airspace | Yes (property is in Class G) |
+| Airspace authorization (LAANC) | Not needed for Class G |
+
+### 2.3 The Critical Constraint: No Autonomous Launch
+
+FAA prohibits unsupervised autonomous flight. A Remote Pilot in Command must:
+- Be responsible for the flight
+- Be able to intervene immediately
+- Explicitly authorize takeoff
+
+**The system design satisfies this with a single-tap authorization step.** The pilot receives an actionable notification, reviews pre-flight conditions (displayed by HA), and taps "LAUNCH." Everything else is automated.
+
+This is the same compliance pattern used by DJI Dock, Skydio Dock, and Percepto — marketed as "autonomous" but legally "human-in-the-loop."
+
+### 2.4 VLOS for This Property
+
+The property is ~300 ft x 150 ft, flat, 1 acre. With the dock on the shed roof and the pilot at the house, VLOS is maintainable for all planned mission corridors. The 50+ trees (some >100 ft) mean missions must follow **constrained corridors** that remain visible from the pilot's position, not a simple perimeter orbit.
+
+### 2.5 Washington State Specifics
+
+WA adds minimal flight restrictions beyond FAA:
+- Privacy: avoid surveillance where people have reasonable expectation of privacy (neighbor yards/windows)
+- Property overflight: perimeter patrol must avoid crossing into neighbors' airspace
+- State parks require permission; private residential land is fine
+
+---
+
+## 3. Operational Concept
+
+### 3.1 The Alarm Response Workflow
+
+```
+Alarm Sensor (PIR, gate, camera AI)
+    │
+    ▼
+Home Assistant Automation
+    │
+    ├── Safety Gate Check
+    │   ├── Wind < 15 mph?
+    │   ├── No rain?
+    │   ├── Battery > threshold?
+    │   ├── GPS lock confirmed?
+    │   ├── Dock connected?
+    │   ├── Drone connected?
+    │   └── Not already airborne?
+    │
+    ├── Select Mission Profile
+    │   ├── Driveway sensor → front sweep
+    │   ├── Backyard motion → rear orbit
+    │   ├── Full alarm → full perimeter loop
+    │   └── Manual → investigate waypoint
+    │
+    ├── Prepare Dock
+    │   └── Open lid (if closed)
+    │
+    ▼
+Actionable Push Notification to RPIC
+    ┌─────────────────────────────────┐
+    │ 🚨 Perimeter Alert — East Fence │
+    │ Wind OK · GPS OK · Battery 85% │
+    │ Mission: Full Perimeter         │
+    │                                 │
+    │  [LAUNCH DRONE]    [IGNORE]     │
+    └─────────────────────────────────┘
+    │
+    ▼ (RPIC taps LAUNCH — this is the legal compliance moment)
+    │
+Home Assistant fires dji_hass.execute_mission
+    │
+    ├── Start live stream
+    ├── Execute waypoint mission
+    ├── Display live feed in HA dashboard
+    ├── Record video (SD card + media server)
+    │
+    ▼
+Mission completes → auto RTH → dock lid closes
+    │
+    ▼
+Audit log: trigger, authorization time, mission, outcome
+```
+
+**Target timeline: alarm → airborne in ~30-60 seconds** (with RPIC authorization). The 2-minute SLA is comfortable.
+
+### 3.2 Drone Selection
+
+**Mavic 2 Zoom is the primary security aircraft.** The optical zoom allows staying higher and farther from obstacles while still capturing detail. This improves safety margin and VLOS reliability.
+
+**Mavic 2 Pro is secondary** — used for redundancy, daylight high-quality capture, or when the Zoom is unavailable.
+
+### 3.3 Mission Design for This Property
+
+With 50+ trees (some >100 ft), missions are **constrained corridor sweeps**, not a simple perimeter orbit.
+
+| Mission | Description | Altitude |
+|---------|-------------|----------|
+| `front_sweep` | Driveway + front edge | 80 ft (clear corridor) |
+| `rear_sweep` | Back fence line | 80 ft |
+| `east_edge` | East property boundary | 110 ft (taller trees) |
+| `west_edge` | West property boundary | 80 ft |
+| `full_perimeter` | All 4 edges sequentially | Variable per segment |
+| `corner_ne` / `nw` / `se` / `sw` | Quick corner investigation | 80-110 ft |
+
+Altitude is a **safety spec** (tree clearance + margin), not a fixed number. Camera angle compensates: gimbal at -30 to -45 degrees provides border coverage from higher altitudes.
+
+---
+
+## 4. Physical Dock Design
+
+### 4.1 Purpose
+
+The dock provides: environmental survivability, deterministic staging, battery readiness, and a motorized lid controlled by Home Assistant.
+
+It is NOT a DJI Dock equivalent — it cannot auto-charge or auto-launch. It is a **"rapid supervised deployment station"** that emulates ~95% of dock behavior through automation + human authorization.
+
+### 4.2 Enclosure Specification
+
+| Component | Material | Rationale |
+|-----------|----------|-----------|
+| Outer enclosure | NEMA 4X polycarbonate or stainless cabinet | Weatherproof, corrosion-resistant |
+| Lid panel | Aluminum sheet with internal ribs + drip edge | Strong, lightweight, rain shedding |
+| Inner liner | Cement board + steel tray under drone bay | Noncombustible (LiPo fire mitigation) |
+| Fasteners | Stainless steel (isolated from aluminum) | Galvanic corrosion prevention |
+| Seals | EPDM gasket + compression latch | Weathertight, UV-resistant |
+| Insulation | Polyisocyanurate (foil-faced), isolated from battery bay | Thermal management |
+
+### 4.3 Environmental Control
+
+Seattle Eastside climate: mild but wet. Condensation is a bigger threat than rain.
+
+| System | Purpose | Implementation |
+|--------|---------|----------------|
+| Heating | Keep batteries 10-30 C | PTC heater pad (reptile heater class), NOT direct battery contact |
+| Ventilation | Condensation/humidity control | 12V fan + filtered intake, dew-point logic |
+| Temperature sensing | Interior + battery zone + ambient | DS18B20 or BME280 sensors |
+| Humidity sensing | Dew point management | BME280 |
+| Smoke/heat detection | LiPo fire early warning | Smoke detector in lid void |
+| Drain | Prevent water pooling | Weep holes with insect mesh |
+
+### 4.4 Lid Mechanism
+
+| Component | Spec |
+|-----------|------|
+| Actuator | 12-24V DC linear actuator, clevis mount |
+| Limit switches | Redundant open + closed microswitches |
+| Pad clear sensor | ToF or IR beam — prevents closing onto drone |
+| Manual override | Physical button + emergency stop |
+
+### 4.5 ESPHome Dock Controller
+
+The dock runs on an **ESP32 with ESPHome**, exposing entities to Home Assistant. Safety interlocks are enforced **locally on the controller**, not in HA — HA sends intents, the ESP32 enforces conditions.
+
+**State machine (firmware-level):**
+```
+CLOSED → OPENING → OPEN → CLOSING → CLOSED
+```
+
+**Safety interlocks (on-controller, not in HA):**
+- Cannot open unless power is healthy
+- Cannot close unless motors disarmed AND pad-clear sensor confirms landed
+- Auto-close timeout with abort on obstruction
+- Charger power relay cut on smoke/overtemp (hardware, not software)
+- Motion timeout: if actuator runs too long, stop and flag fault
+
+**Entities exposed to HA:**
+
+| Entity | Type | Notes |
+|--------|------|-------|
+| `cover.drone_dock_lid` | Cover | Open/close/stop |
+| `sensor.dock_temperature` | Temperature | Interior |
+| `sensor.dock_battery_zone_temp` | Temperature | Near battery/drone |
+| `sensor.dock_humidity` | Humidity | Interior |
+| `binary_sensor.dock_lid_open` | Binary sensor | Limit switch |
+| `binary_sensor.dock_lid_closed` | Binary sensor | Limit switch |
+| `binary_sensor.dock_pad_clear` | Binary sensor | ToF/IR |
+| `binary_sensor.dock_smoke` | Binary sensor | Smoke detector |
+| `switch.dock_heater` | Switch | PTC heater relay |
+| `switch.dock_fan` | Switch | Ventilation fan relay |
+| `switch.dock_charger_power` | Switch | Smart outlet / relay for OEM charger |
+| `sensor.dock_power_status` | Sensor | Mains/UPS status |
+
+### 4.6 Placement
+
+On the shed roof. Requirements:
+- Clear vertical column above (no overhanging branches)
+- Clear lateral clearance ~30-50 ft for takeoff/landing
+- Clear approach lane for return-to-home (no branches in the direction of final approach)
+- Power from shed below
+- WiFi coverage from house network
+
+### 4.7 Power Architecture
+
+```
+Mains (from shed) → UPS → 12/24V DC supply
+                          ├── Actuator rail (fused)
+                          ├── Compute/sensor rail (fused)
+                          └── Heater/fan rail (fused)
+
+Separate smart outlet → DJI OEM charger → battery hub
+(HA controls the outlet; never modify DJI charging electronics)
+```
+
+UPS is important: brownouts during storms are common — exactly when you want the system most.
+
+---
+
+## 5. Battery Lifecycle Management
+
+### 5.1 The Core Problem
+
+Mavic 2 LiPo batteries degrade quickly when stored at high charge. They self-discharge (generating heat), bloat after relatively few cycles, and are designed for intermittent recreational use — not persistent readiness.
+
+**Design mindset: batteries are consumables** (like tires). Plan for annual replacement.
+
+### 5.2 Charge Strategy
+
+| Role | SOC Target | Location | Rotation |
+|------|------------|----------|----------|
+| Hot standby (installed in drone) | 80-85% | In dock | Rotated weekly |
+| Ready spare | 55-65% (storage band) | In charging hub inside dock | Promoted to standby weekly |
+| Charging / cooling | Cycling | Charging hub | As needed |
+
+**Inventory:** 3 batteries per drone minimum (6 total for two drones).
+
+### 5.3 Automated Maintenance (via HA)
+
+| Automation | Trigger | Action |
+|------------|---------|--------|
+| Weekly rotation reminder | Schedule (Sunday AM) | Notify pilot to swap batteries |
+| Charge maintenance | Standby drops below 75% | Enable charger power outlet for bounded window |
+| Thermal gating | Dock temp outside 5-40 C | Disable charger power |
+| Quarterly deep cycle | Schedule (quarterly) | Remind pilot to full cycle all packs |
+| Swelling/degradation check | Every rotation | Visual inspection checklist notification |
+
+### 5.4 Expected Lifespan
+
+| Strategy | Expected Useful Life |
+|----------|---------------------|
+| Always at 100% | 3-6 months |
+| Managed standby at 80-85% | 9-15 months |
+| Rotated storage regime | 12-24 months |
+
+### 5.5 DJI Battery Settings
+
+- Set auto-discharge delay to 1-3 days (default ~10 days) so packs self-drain to storage level faster if not flown
+- This prevents prolonged high-SOC aging
+
+### 5.6 What NOT To Attempt
+
+- Permanent powered drone in dock
+- DIY charging contacts on the aircraft
+- Robotic battery swapping
+- Unattended overnight charging cycles
+- Third-party batteries in a dock scenario (highest failure item in unattended deployments)
+
+---
+
+## 6. DJI SDK Reality Check
+
+### 6.1 What's Available for Mavic 2
 
 | SDK | Platform | Mavic 2 Support | Server-Side? |
 |-----|----------|-----------------|--------------|
@@ -24,9 +306,8 @@ The architecture solves this with a **two-tier bridge pattern**: an Android app 
 | Windows SDK | Windows 10+ UWP | **Yes** | Partial — needs Windows box + RC USB |
 | Onboard SDK | Linux (C++) | **No** (Matrice only) | Yes, but not for Mavic 2 |
 | Cloud API | REST/MQTT/WS | **No** (Enterprise only) | Yes, but not for Mavic 2 |
-| Payload SDK | Embedded | **No** | No |
 
-### What Mobile SDK v4 Actually Provides for Mavic 2
+### 6.2 What Mobile SDK v4 Provides
 
 | Capability | API | Detail |
 |------------|-----|--------|
@@ -39,467 +320,310 @@ The architecture solves this with a **two-tier bridge pattern**: an Android app 
 | Telemetry | `FlightControllerState` | 10 Hz: GPS, altitude, velocity, heading, flight mode, motors, wind |
 | Battery | `Battery` | Charge %, voltage, current, temp, cycles, remaining mAh |
 | Signal Strength | `AirLink` | Uplink/downlink quality |
-| Live Video | `VideoFeeder` + `LiveStreamManager` | H.264 NAL units; built-in RTMP push (720p, 1-5 Mbps) |
+| Live Video | `VideoFeeder` + `LiveStreamManager` | H.264 RTMP push (720p, 1-5 Mbps) |
 | Media Download | `MediaManager` | Download photos/videos from SD card |
 
-### What's NOT Available
+### 6.3 What's NOT Available
 
-- **No RTSP** — RTSP is only in MSDK v5 (which doesn't support Mavic 2)
-- **No direct server-side control** — Always requires Android/iOS/Windows intermediary
+- **No RTSP** — only in MSDK v5 (doesn't support Mavic 2)
+- **No server-side control** — always requires Android/iOS/Windows intermediary
 - **No headless SDK** — DJI SDK requires a UI context on Android (workarounds exist)
-- **99-waypoint limit** — Hardware constraint of the flight controller
-- **Video feed is 720p/1080p** — Live stream, not the 4K recording resolution
+- **99-waypoint limit** — flight controller hardware constraint
+- **Live feed is 720p** — not the 4K recording resolution
+- **No in-aircraft battery charging** — no USB/auxiliary charge path exists
+- **No auto-launch** — motors must be armed via controller/app
 
 ---
 
-## 3. System Architecture
+## 7. Software Architecture
 
-### 3.1 High-Level Overview
+### 7.1 High-Level Overview
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    HOME ASSISTANT                         │
-│                                                          │
-│  ┌─────────────────────────────────────────────────┐     │
-│  │          dji_hass Custom Integration             │     │
-│  │                                                  │     │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │     │
-│  │  │  Config   │  │Coordinatr│  │   Service     │  │     │
-│  │  │  Flow     │  │(MQTT Sub)│  │   Handlers   │  │     │
-│  │  └──────────┘  └────┬─────┘  └──────┬───────┘  │     │
-│  │                     │               │           │     │
-│  │  ┌──────────────────┴───────────────┴────────┐  │     │
-│  │  │            MQTT Client (aiomqtt)           │  │     │
-│  │  └──────────────────┬────────────────────────┘  │     │
-│  │                     │                            │     │
-│  │  ┌─────────┐ ┌─────┴────┐ ┌──────────────────┐ │     │
-│  │  │ Sensors │ │ Binary   │ │ Camera/Switch     │ │     │
-│  │  │ Battery │ │ Sensors  │ │ Record/Snapshot   │ │     │
-│  │  │ GPS     │ │ Airborne │ │                   │ │     │
-│  │  │ Signal  │ │ Connected│ │                   │ │     │
-│  │  └─────────┘ └──────────┘ └──────────────────┘ │     │
-│  └─────────────────────────────────────────────────┘     │
-│                                                          │
-│  ┌─────────────────────┐                                 │
-│  │   MQTT Broker        │  (Mosquitto add-on)            │
-│  └──────────┬──────────┘                                 │
-│             │                                            │
-│  ┌──────────┴──────────┐                                 │
-│  │  Media Server        │  (mediamtx / go2rtc add-on)    │
-│  │  RTMP in → WebRTC out│                                │
-│  └─────────────────────┘                                 │
-└─────────────┬──────────────────────────────────────┬─────┘
-              │ MQTT (tcp/1883)                      │ RTMP (tcp/1935)
-              │ LAN / WiFi                           │ LAN / WiFi
-┌─────────────┴──────────────────────────────────────┴─────┐
-│              ANDROID BRIDGE APP                           │
-│              (dedicated Android device + RC)               │
-│                                                          │
-│  ┌─────────────────────────────────────────────────┐     │
-│  │               DJI Mobile SDK v4                  │     │
-│  │                                                  │     │
-│  │  ┌───────────┐ ┌──────────┐ ┌────────────────┐  │     │
-│  │  │ Flight    │ │ Camera/  │ │ LiveStream     │  │     │
-│  │  │ Controller│ │ Gimbal   │ │ Manager        │  │     │
-│  │  │           │ │          │ │ (RTMP push)    │  │     │
-│  │  └─────┬─────┘ └────┬────┘ └───────┬────────┘  │     │
-│  │        │            │              │            │     │
-│  │  ┌─────┴────────────┴──────────────┴─────────┐  │     │
-│  │  │           MQTT Service Layer               │  │     │
-│  │  │  - Publishes telemetry (10 Hz → 1 Hz)     │  │     │
-│  │  │  - Subscribes to command topics            │  │     │
-│  │  │  - Request/response via correlation IDs    │  │     │
-│  │  └──────────────────┬────────────────────────┘  │     │
-│  └─────────────────────┘                            │     │
-│                        │ USB                         │     │
-│              ┌─────────┴─────────┐                   │     │
-│              │  DJI Remote Ctrl  │                   │     │
-│              └─────────┬─────────┘                   │     │
-│                        │ OcuSync 2.0                 │     │
-│              ┌─────────┴─────────┐                   │     │
-│              │  Mavic 2 Pro/Zoom │                   │     │
-│              └───────────────────┘                   │     │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                         HOME ASSISTANT                            │
+│                                                                   │
+│  ┌─────────────────────┐  ┌──────────────────────────────────┐   │
+│  │   ESPHome Dock       │  │       dji_hass Integration       │   │
+│  │   Controller         │  │                                  │   │
+│  │                      │  │  ┌──────────┐ ┌──────────────┐  │   │
+│  │  cover.dock_lid      │  │  │ MQTT     │ │  Service     │  │   │
+│  │  sensor.dock_temp    │  │  │ Coord.   │ │  Handlers    │  │   │
+│  │  switch.dock_heater  │  │  └────┬─────┘ └──────┬───────┘  │   │
+│  │  binary.dock_smoke   │  │       │              │           │   │
+│  │  ...                 │  │  ┌────┴──────────────┴────────┐  │   │
+│  └──────────┬───────────┘  │  │     MQTT Client (aiomqtt)  │  │   │
+│             │ ESPHome API  │  └────────────┬───────────────┘  │   │
+│             │              │               │                  │   │
+│  ┌──────────┴───────────┐  │  Sensors │ Binary │ Camera │ DT  │   │
+│  │  Mosquitto Broker    │◄─┤──────────────────────────────────┤   │
+│  └──────────┬───────────┘  └──────────────────────────────────┘   │
+│             │                                                     │
+│  ┌──────────┴───────────┐                                        │
+│  │  Media Server         │  (go2rtc / mediamtx)                   │
+│  │  RTMP in → WebRTC out │                                        │
+│  └──────────────────────┘                                        │
+└────────────┬──────────────────────────────────────────┬──────────┘
+             │ MQTT (tcp/1883)                          │ RTMP (tcp/1935)
+             │ LAN / WiFi                               │
+┌────────────┴──────────────────────────────────────────┴──────────┐
+│                     ANDROID BRIDGE APP                             │
+│                     (dedicated Android device + RC)                │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │                   DJI Mobile SDK v4                       │    │
+│  │  FlightController │ Camera/Gimbal │ LiveStreamManager     │    │
+│  └──────────┬────────────────┬───────────────┬──────────────┘    │
+│             │                │               │                    │
+│  ┌──────────┴────────────────┴───────────────┴──────────────┐    │
+│  │                 MQTT Service Layer                         │    │
+│  │  - Telemetry publish (10 Hz → 1 Hz configurable)          │    │
+│  │  - Command subscribe + execute + respond                   │    │
+│  │  - Mission cache + translate JSON → DJIWaypointMission     │    │
+│  │  - RTMP push to media server                               │    │
+│  │  - LWT: "offline" on disconnect                            │    │
+│  └──────────────────────────┬───────────────────────────────┘    │
+│                              │ USB                                │
+│                    ┌─────────┴─────────┐                         │
+│                    │  DJI Remote Ctrl   │                         │
+│                    └─────────┬─────────┘                         │
+│                              │ OcuSync 2.0                       │
+│          ┌───────────────────┴───────────────────┐               │
+│          │            PHYSICAL DOCK               │               │
+│          │  ┌───────────────────────────────┐     │               │
+│          │  │  Mavic 2 Zoom (primary)       │     │               │
+│          │  │  or Mavic 2 Pro (secondary)   │     │               │
+│          │  └───────────────────────────────┘     │               │
+│          │  ESPHome ESP32: lid, sensors, heater   │               │
+│          └────────────────────────────────────────┘               │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Component Responsibilities
+### 7.2 Component Responsibilities
 
-#### Component 1: Android Bridge App
+#### Android Bridge App
 
-**Purpose:** Translates between DJI proprietary SDK and standard MQTT/RTMP protocols.
-
-**Responsibilities:**
-- Initialize DJI SDK, manage registration and product connection lifecycle
-- Subscribe to MQTT command topics, execute DJI SDK calls
-- Publish telemetry to MQTT at configurable intervals (default 1 Hz, burst 10 Hz)
-- Push live video stream via RTMP to the media server
-- Handle SDK errors and publish status/health
-- Auto-reconnect on connection loss (both MQTT and DJI SDK)
-- Persist mission definitions locally for offline execution
+**Purpose:** Translates between DJI proprietary SDK and standard MQTT/RTMP.
 
 **Technology:** Kotlin, DJI Mobile SDK v4, Eclipse Paho MQTT client
 
-**Runtime:** Dedicated Android device (e.g., old phone, Android mini-PC), always connected to RC via USB, always on WiFi to reach HA network.
-
-#### Component 2: dji_hass HA Integration
-
-**Purpose:** Exposes drone capabilities as native HA entities and services.
+**Runtime:** Dedicated Android device (old phone, Android mini-PC), always connected to RC via USB, always on WiFi. Runs as an Android Foreground Service with persistent notification and auto-restart.
 
 **Responsibilities:**
-- Config flow for setup (MQTT broker, bridge connection, media server URL)
-- MQTT-based coordinator that subscribes to telemetry topics
-- Entity platforms: sensors, binary sensors, switches, camera
-- Service handlers for mission execution, RTH, camera commands
-- Availability tracking based on bridge heartbeat
+- DJI SDK registration and product connection lifecycle
+- Subscribe to MQTT command topics, execute DJI SDK calls, publish responses
+- Publish telemetry to MQTT (downsampled from 10 Hz to 1 Hz; burst 10 Hz during missions)
+- Push live video via RTMP to media server
+- Cache mission definitions from retained MQTT messages
+- Translate JSON mission format → `DJIMutableWaypointMission`
+- Validate missions against SDK constraints before upload
+- Auto-reconnect on connection loss (MQTT and DJI SDK)
+- MQTT Last Will and Testament: `"offline"` on disconnect
+
+**Hardware:**
+
+| Component | Purpose | Example |
+|-----------|---------|---------|
+| Android device | Run bridge app | Old phone (Android 7+), Android mini-PC |
+| USB OTG cable | Connect Android to RC | USB-C or micro-USB OTG |
+| DJI Remote Controller | Bridge to aircraft | Mavic 2 RC |
+| WiFi | Connect to HA network | Same LAN |
+| Power supply | Keep Android powered | USB charger (always plugged in) |
+
+#### dji_hass HA Integration
+
+**Purpose:** Exposes drone + dock as native HA entities and services. Orchestrates the alarm → authorization → flight workflow.
 
 **Technology:** Python 3.12+, aiomqtt, Home Assistant Core 2024.2+
 
-#### Component 3: MQTT Broker
+#### ESPHome Dock Controller
 
-**Purpose:** Message bus between Android bridge and HA integration.
+**Purpose:** Physical dock management with local safety interlocks.
 
-**Runtime:** Mosquitto (standard HA add-on, already available in most setups)
+**Technology:** ESP32, ESPHome, 12/24V actuator, sensors
 
-#### Component 4: Media Server
-
-**Purpose:** Receives RTMP from the bridge, serves streams to HA frontend.
-
-**Runtime:** mediamtx or go2rtc (HA add-on). Receives RTMP, can serve HLS/WebRTC/RTSP to HA's camera entity.
+**Key principle:** Safety logic runs on the ESP32, not in HA. HA sends intents ("open lid"), the controller enforces preconditions.
 
 ---
 
-## 4. MQTT Topic Design
+## 8. MQTT Topic Design
 
-### 4.1 Topic Namespace
+### 8.1 Topic Namespace
 
-All topics under `dji_hass/{drone_id}/` where `drone_id` is derived from aircraft serial number.
+All topics under `dji_hass/{drone_id}/` where `drone_id` is the aircraft serial number.
 
-### 4.2 Telemetry (Bridge → HA)
+### 8.2 Telemetry (Bridge → HA)
 
-Published by the Android bridge. QoS 0 for high-frequency data, QoS 1 for state changes.
-
-```
-dji_hass/{drone_id}/telemetry/flight
-  Payload (JSON, 1 Hz):
-  {
-    "lat": 47.6062,
-    "lon": -122.3321,
-    "alt": 45.2,              // meters, relative to takeoff
-    "alt_msl": 102.3,         // meters above sea level (if available)
-    "heading": 127.5,         // degrees
-    "speed_x": 2.1,           // m/s north
-    "speed_y": -0.5,          // m/s east
-    "speed_z": 0.0,           // m/s down
-    "ground_speed": 2.16,     // m/s computed
-    "flight_mode": "GPS",     // ATTI, GPS, SPORT, etc.
-    "motors_on": true,
-    "is_flying": true,
-    "gps_signal": 5,          // 0-10
-    "satellite_count": 14,
-    "wind_warning": 0,        // 0=none, 1=moderate, 2=strong
-    "timestamp": 1739980800
-  }
-
-dji_hass/{drone_id}/telemetry/battery
-  Payload (JSON, 0.2 Hz):
-  {
-    "charge_percent": 78,
-    "voltage_mv": 15200,
-    "current_ma": -2100,
-    "temperature_c": 32,
-    "remaining_mah": 2800,
-    "full_charge_mah": 3600,
-    "discharge_cycles": 42,
-    "flight_time_remaining_s": 1200,
-    "timestamp": 1739980800
-  }
-
-dji_hass/{drone_id}/telemetry/gimbal
-  Payload (JSON, 1 Hz):
-  {
-    "pitch": -45.0,
-    "roll": 0.2,
-    "yaw": 127.5,
-    "mode": "YAW_FOLLOW",
-    "timestamp": 1739980800
-  }
-
-dji_hass/{drone_id}/telemetry/camera
-  Payload (JSON, on change):
-  {
-    "mode": "RECORD_VIDEO",     // SHOOT_PHOTO, RECORD_VIDEO, PLAYBACK
-    "is_recording": true,
-    "recording_time_s": 45,
-    "is_storing_photo": false,
-    "sd_card_remaining_mb": 28500,
-    "iso": 100,
-    "shutter_speed": "1/500",
-    "aperture": 2.8,
-    "ev": 0,
-    "timestamp": 1739980800
-  }
-
-dji_hass/{drone_id}/telemetry/signal
-  Payload (JSON, 1 Hz):
-  {
-    "uplink_quality": 85,      // 0-100%
-    "downlink_quality": 92,    // 0-100%
-    "timestamp": 1739980800
-  }
-```
-
-### 4.3 State (Bridge → HA)
-
-Published with QoS 1 and `retain: true`.
+QoS 0 for high-frequency data, QoS 1 for state changes.
 
 ```
-dji_hass/{drone_id}/state/connection
-  Payload: "online" | "offline"
-  (Bridge sets LWT to "offline")
+dji_hass/{drone_id}/telemetry/flight        (1 Hz)
+{
+  "lat": 47.6062, "lon": -122.3321,
+  "alt": 45.2,                    // meters relative to takeoff
+  "heading": 127.5,               // degrees
+  "speed_x": 2.1, "speed_y": -0.5, "speed_z": 0.0,
+  "ground_speed": 2.16,           // m/s computed
+  "flight_mode": "GPS",           // ATTI, GPS, SPORT
+  "motors_on": true, "is_flying": true,
+  "gps_signal": 5,                // 0-10
+  "satellite_count": 14,
+  "wind_warning": 0,              // 0=none, 1=moderate, 2=strong
+  "timestamp": 1739980800
+}
 
-dji_hass/{drone_id}/state/flight
-  Payload: "landed" | "airborne" | "returning_home" | "landing"
+dji_hass/{drone_id}/telemetry/battery       (0.2 Hz)
+{
+  "charge_percent": 78,
+  "voltage_mv": 15200, "current_ma": -2100,
+  "temperature_c": 32,
+  "remaining_mah": 2800, "full_charge_mah": 3600,
+  "discharge_cycles": 42,
+  "flight_time_remaining_s": 1200,
+  "timestamp": 1739980800
+}
 
-dji_hass/{drone_id}/state/mission
-  Payload (JSON):
-  {
-    "status": "idle",          // idle, uploading, executing, paused, completed, error
-    "mission_id": null,
-    "progress": 0.0,           // 0.0-1.0
-    "current_waypoint": 0,
-    "total_waypoints": 0,
-    "error": null
-  }
+dji_hass/{drone_id}/telemetry/gimbal        (1 Hz)
+{ "pitch": -45.0, "roll": 0.2, "yaw": 127.5, "mode": "YAW_FOLLOW" }
 
-dji_hass/{drone_id}/state/stream
-  Payload (JSON):
-  {
-    "is_streaming": true,
-    "rtmp_url": "rtmp://192.168.1.10:1935/live/mavic2",
-    "resolution": "720p",
-    "bitrate_kbps": 3000
-  }
+dji_hass/{drone_id}/telemetry/camera        (on change)
+{
+  "mode": "RECORD_VIDEO",
+  "is_recording": true, "recording_time_s": 45,
+  "sd_card_remaining_mb": 28500,
+  "iso": 100, "shutter_speed": "1/500", "aperture": 2.8
+}
+
+dji_hass/{drone_id}/telemetry/signal        (1 Hz)
+{ "uplink_quality": 85, "downlink_quality": 92 }
 ```
 
-### 4.4 Commands (HA → Bridge)
+### 8.3 State (Bridge → HA)
 
-Published by HA integration. QoS 1. Bridge subscribes and executes.
+QoS 1, `retain: true`.
 
-All commands follow a request/response pattern using correlation IDs:
+```
+dji_hass/{drone_id}/state/connection     "online" | "offline"  (LWT = "offline")
+dji_hass/{drone_id}/state/flight         "landed" | "airborne" | "returning_home" | "landing"
+dji_hass/{drone_id}/state/mission        { "status": "idle|uploading|executing|paused|completed|error",
+                                           "mission_id": null, "progress": 0.0,
+                                           "current_waypoint": 0, "total_waypoints": 0, "error": null }
+dji_hass/{drone_id}/state/stream         { "is_streaming": true, "rtmp_url": "rtmp://...",
+                                           "resolution": "720p", "bitrate_kbps": 3000 }
+```
+
+### 8.4 Commands (HA → Bridge)
+
+QoS 1. Request/response pattern with correlation IDs.
 
 ```
 dji_hass/{drone_id}/command/{action}
-  Payload (JSON):
-  {
-    "id": "uuid-correlation-id",
-    "params": { ... }           // action-specific
-  }
+  { "id": "uuid", "params": { ... } }
 
 dji_hass/{drone_id}/command/{action}/response
-  Payload (JSON):
-  {
-    "id": "uuid-correlation-id",
-    "success": true,
-    "error": null,
-    "data": { ... }             // optional response data
-  }
+  { "id": "uuid", "success": true, "error": null, "data": { ... } }
 ```
 
-#### Available Commands
+**Available commands:**
+
+| Category | Commands |
+|----------|----------|
+| Flight | `takeoff`, `land`, `confirm_landing`, `return_to_home`, `cancel_rth` |
+| Mission | `execute_mission` (params: `mission_id`), `pause_mission`, `resume_mission`, `stop_mission` |
+| Camera | `take_photo`, `start_recording`, `stop_recording`, `set_camera_mode` |
+| Gimbal | `set_gimbal` (params: `pitch`, `mode`), `reset_gimbal` |
+| Stream | `start_stream` (params: `rtmp_url`), `stop_stream` |
+| System | `set_home` (params: `lat`, `lon`) |
+
+### 8.5 Mission Definitions (HA → Bridge)
+
+Retained MQTT messages cached by the bridge:
 
 ```
-# Flight control
-dji_hass/{drone_id}/command/takeoff          params: {}
-dji_hass/{drone_id}/command/land             params: {}
-dji_hass/{drone_id}/command/confirm_landing  params: {}
-dji_hass/{drone_id}/command/return_to_home   params: {}
-dji_hass/{drone_id}/command/cancel_rth       params: {}
-
-# Mission control
-dji_hass/{drone_id}/command/execute_mission  params: {"mission_id": "patrol_1"}
-dji_hass/{drone_id}/command/pause_mission    params: {}
-dji_hass/{drone_id}/command/resume_mission   params: {}
-dji_hass/{drone_id}/command/stop_mission     params: {}
-
-# Camera
-dji_hass/{drone_id}/command/take_photo       params: {}
-dji_hass/{drone_id}/command/start_recording  params: {}
-dji_hass/{drone_id}/command/stop_recording   params: {}
-dji_hass/{drone_id}/command/set_camera_mode  params: {"mode": "SHOOT_PHOTO"}
-
-# Gimbal
-dji_hass/{drone_id}/command/set_gimbal       params: {"pitch": -45, "mode": "ABSOLUTE_ANGLE"}
-dji_hass/{drone_id}/command/reset_gimbal     params: {}
-
-# Stream
-dji_hass/{drone_id}/command/start_stream     params: {"rtmp_url": "rtmp://..."}
-dji_hass/{drone_id}/command/stop_stream      params: {}
-
-# System
-dji_hass/{drone_id}/command/set_home         params: {"lat": 47.6, "lon": -122.3}
-```
-
-### 4.5 Mission Definitions (HA → Bridge)
-
-Missions are uploaded as retained MQTT messages so the bridge can cache them:
-
-```
-dji_hass/{drone_id}/missions/{mission_id}
-  Payload (JSON, retained):
-  {
-    "id": "patrol_1",
-    "name": "Front Yard Patrol",
-    "speed_mps": 5.0,
-    "finish_action": "GO_HOME",       // GO_HOME, AUTO_LAND, NO_ACTION
-    "heading_mode": "AUTO",
-    "flight_path_mode": "CURVED",
-    "waypoints": [
-      {
-        "lat": 47.6062,
-        "lon": -122.3321,
-        "alt": 30.0,
-        "speed_mps": 5.0,
-        "gimbal_pitch": -45.0,
-        "stay_ms": 2000,
-        "actions": ["START_TAKE_PHOTO"]
-      },
-      {
-        "lat": 47.6065,
-        "lon": -122.3318,
-        "alt": 25.0,
-        "speed_mps": 3.0,
-        "gimbal_pitch": -90.0,
-        "stay_ms": 0,
-        "actions": ["START_RECORD"]
-      }
-    ]
-  }
+dji_hass/{drone_id}/missions/{mission_id}   (retained)
+{
+  "id": "full_perimeter",
+  "name": "Full Perimeter Sweep",
+  "speed_mps": 5.0,
+  "finish_action": "GO_HOME",
+  "heading_mode": "AUTO",
+  "flight_path_mode": "CURVED",
+  "waypoints": [
+    { "lat": 47.6062, "lon": -122.3321, "alt": 24.4,
+      "speed_mps": 5.0, "gimbal_pitch": -45.0,
+      "stay_ms": 2000, "actions": ["START_TAKE_PHOTO"] },
+    { "lat": 47.6065, "lon": -122.3318, "alt": 33.5,
+      "speed_mps": 3.0, "gimbal_pitch": -90.0,
+      "stay_ms": 0, "actions": ["START_RECORD"] }
+  ]
+}
 ```
 
 ---
 
-## 5. HA Integration Design
+## 9. HA Integration Design
 
-### 5.1 Entities
+### 9.1 Entities
 
 #### Sensors
 
 | Entity ID | Device Class | Unit | Source |
 |-----------|-------------|------|--------|
-| `sensor.mavic2_battery` | `battery` | `%` | `telemetry/battery → charge_percent` |
-| `sensor.mavic2_altitude` | `distance` | `m` | `telemetry/flight → alt` |
-| `sensor.mavic2_ground_speed` | `speed` | `m/s` | `telemetry/flight → ground_speed` |
-| `sensor.mavic2_gps_satellites` | — | — | `telemetry/flight → satellite_count` |
-| `sensor.mavic2_signal_uplink` | — | `%` | `telemetry/signal → uplink_quality` |
-| `sensor.mavic2_signal_downlink` | — | `%` | `telemetry/signal → downlink_quality` |
-| `sensor.mavic2_battery_temperature` | `temperature` | `°C` | `telemetry/battery → temperature_c` |
-| `sensor.mavic2_flight_mode` | — | — | `telemetry/flight → flight_mode` |
-| `sensor.mavic2_heading` | — | `°` | `telemetry/flight → heading` |
-| `sensor.mavic2_flight_time_remaining` | `duration` | `s` | `telemetry/battery → flight_time_remaining_s` |
-| `sensor.mavic2_mission_status` | — | — | `state/mission → status` |
+| `sensor.{name}_battery` | `battery` | `%` | `telemetry/battery → charge_percent` |
+| `sensor.{name}_altitude` | `distance` | `m` | `telemetry/flight → alt` |
+| `sensor.{name}_ground_speed` | `speed` | `m/s` | `telemetry/flight → ground_speed` |
+| `sensor.{name}_gps_satellites` | — | — | `telemetry/flight → satellite_count` |
+| `sensor.{name}_signal_uplink` | — | `%` | `telemetry/signal → uplink_quality` |
+| `sensor.{name}_signal_downlink` | — | `%` | `telemetry/signal → downlink_quality` |
+| `sensor.{name}_battery_temperature` | `temperature` | `°C` | `telemetry/battery → temperature_c` |
+| `sensor.{name}_flight_mode` | — | — | `telemetry/flight → flight_mode` |
+| `sensor.{name}_heading` | — | `°` | `telemetry/flight → heading` |
+| `sensor.{name}_flight_time_remaining` | `duration` | `s` | `telemetry/battery → flight_time_remaining_s` |
+| `sensor.{name}_mission_status` | — | — | `state/mission → status` |
 
 #### Binary Sensors
 
 | Entity ID | Device Class | Source |
 |-----------|-------------|--------|
-| `binary_sensor.mavic2_connected` | `connectivity` | `state/connection` |
-| `binary_sensor.mavic2_airborne` | — | `state/flight ∈ {airborne, returning_home}` |
-| `binary_sensor.mavic2_motors_on` | — | `telemetry/flight → motors_on` |
-| `binary_sensor.mavic2_recording` | — | `telemetry/camera → is_recording` |
-| `binary_sensor.mavic2_streaming` | — | `state/stream → is_streaming` |
+| `binary_sensor.{name}_connected` | `connectivity` | `state/connection` |
+| `binary_sensor.{name}_airborne` | — | `state/flight ∈ {airborne, returning_home}` |
+| `binary_sensor.{name}_motors_on` | — | `telemetry/flight → motors_on` |
+| `binary_sensor.{name}_recording` | — | `telemetry/camera → is_recording` |
+| `binary_sensor.{name}_streaming` | — | `state/stream → is_streaming` |
 
 #### Camera
 
 | Entity ID | Source |
 |-----------|--------|
-| `camera.mavic2_live` | Media server URL from `state/stream → rtmp_url` via go2rtc/mediamtx |
+| `camera.{name}_live` | Media server stream URL |
 
 #### Device Tracker
 
 | Entity ID | Source |
 |-----------|--------|
-| `device_tracker.mavic2` | `telemetry/flight → lat, lon` |
+| `device_tracker.{name}` | `telemetry/flight → lat, lon` |
 
-### 5.2 Services
+### 9.2 Services
 
-```yaml
-# services.yaml
+| Service | Description | Fields |
+|---------|-------------|--------|
+| `dji_hass.execute_mission` | Upload and execute waypoint mission | `mission_id` (required) |
+| `dji_hass.return_to_home` | Command RTH | — |
+| `dji_hass.takeoff` | Take off and hover | — |
+| `dji_hass.land` | Land at current position | — |
+| `dji_hass.take_photo` | Capture single photo | — |
+| `dji_hass.start_recording` | Begin video recording | — |
+| `dji_hass.stop_recording` | Stop video recording | — |
+| `dji_hass.start_stream` | Start RTMP live stream | — |
+| `dji_hass.stop_stream` | Stop live stream | — |
+| `dji_hass.set_gimbal` | Set gimbal pitch angle | `pitch` (-90 to +30) |
+| `dji_hass.pause_mission` | Pause executing mission | — |
+| `dji_hass.resume_mission` | Resume paused mission | — |
+| `dji_hass.stop_mission` | Abort mission (hover) | — |
 
-execute_mission:
-  name: Execute Mission
-  description: Upload and execute a predefined waypoint mission
-  fields:
-    mission_id:
-      name: Mission ID
-      description: Identifier of the mission to execute
-      required: true
-      example: "patrol_1"
-      selector:
-        text:
+### 9.3 Coordinator Design
 
-return_to_home:
-  name: Return to Home
-  description: Command the drone to return to its home point
-
-takeoff:
-  name: Takeoff
-  description: Command the drone to take off and hover
-
-land:
-  name: Land
-  description: Command the drone to land at current position
-
-take_photo:
-  name: Take Photo
-  description: Capture a single photo
-
-start_recording:
-  name: Start Recording
-  description: Begin video recording on the drone camera
-
-stop_recording:
-  name: Stop Recording
-  description: Stop video recording
-
-start_stream:
-  name: Start Live Stream
-  description: Start RTMP live video stream to the media server
-
-stop_stream:
-  name: Stop Live Stream
-  description: Stop RTMP live video stream
-
-set_gimbal:
-  name: Set Gimbal Angle
-  description: Set the gimbal pitch angle
-  fields:
-    pitch:
-      name: Pitch
-      description: Gimbal pitch angle in degrees (-90 to +30)
-      required: true
-      selector:
-        number:
-          min: -90
-          max: 30
-          step: 1
-          unit_of_measurement: "°"
-
-pause_mission:
-  name: Pause Mission
-  description: Pause the currently executing mission (drone hovers in place)
-
-resume_mission:
-  name: Resume Mission
-  description: Resume a paused mission
-
-stop_mission:
-  name: Stop Mission
-  description: Abort the current mission (drone hovers in place)
-```
-
-### 5.3 Coordinator Design
-
-Unlike a typical polling coordinator, dji_hass uses an **MQTT-subscription coordinator** — it doesn't poll, it receives pushed data.
+The coordinator is **MQTT-subscription based** (not polling):
 
 ```python
 class DjiMqttCoordinator:
@@ -508,201 +632,46 @@ class DjiMqttCoordinator:
     def __init__(self, hass, entry, mqtt_client):
         self.data = {
             "connection": "offline",
-            "flight": {},
-            "battery": {},
-            "gimbal": {},
-            "camera": {},
-            "signal": {},
-            "mission": {},
-            "stream": {},
+            "flight": {}, "battery": {}, "gimbal": {},
+            "camera": {}, "signal": {}, "mission": {}, "stream": {},
         }
-        self._listeners = []      # HA entity update callbacks
+        self._listeners = []
         self._mqtt = mqtt_client
         self._last_heartbeat = None
 
     async def async_start(self):
-        """Subscribe to all telemetry and state topics."""
+        """Subscribe to all drone topics."""
         await self._mqtt.subscribe(f"dji_hass/{self._drone_id}/#")
-        # Start heartbeat monitor (mark unavailable if no message in 30s)
 
     async def _on_message(self, topic, payload):
-        """Route incoming MQTT messages to the correct data bucket."""
-        # Parse topic, update self.data, notify listeners
-        # Entities read from self.data — they are stateless views
+        """Route MQTT messages to data buckets, notify entity listeners."""
 
     async def async_send_command(self, action, params=None):
-        """Publish a command and wait for response (with timeout)."""
-        correlation_id = str(uuid4())
-        # Publish to command topic
-        # Wait for response on command/{action}/response with matching ID
-        # Timeout after 10s → raise error
+        """Publish command, wait for correlation-ID response (10s timeout)."""
 ```
 
-### 5.4 Config Flow
+### 9.4 Config Flow
 
 ```
-Step 1: Connection Setup
+Step 1: Connection
   ├── MQTT Broker Host (default: core-mosquitto)
-  ├── MQTT Broker Port (default: 1883)
-  ├── MQTT Username
-  ├── MQTT Password
+  ├── MQTT Port (default: 1883)
+  ├── MQTT Username / Password
   └── Drone ID (auto-discovered from dji_hass/+/state/connection)
 
 Step 2: Media Server (optional)
-  ├── Media Server Type (mediamtx / go2rtc / none)
-  └── RTMP Ingest URL (default: rtmp://localhost:1935/live/mavic2)
+  ├── Media Server Type (go2rtc / mediamtx / none)
+  └── RTMP Ingest URL
 
 Step 3: Validation
   ├── Test MQTT connection
-  ├── Check for bridge heartbeat on drone topics
+  ├── Check bridge heartbeat
   └── Verify media server reachability
 ```
 
----
-
-## 6. Android Bridge App Design
-
-### 6.1 Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                 Android Bridge App                    │
-│                                                      │
-│  ┌────────────────┐    ┌────────────────────────┐   │
-│  │  Foreground     │    │   DJI SDK Manager       │   │
-│  │  Service        │    │   - Registration         │   │
-│  │  (always-on)    │    │   - Product connection   │   │
-│  │                 │    │   - Component access      │   │
-│  └───────┬─────────┘    └───────────┬────────────┘   │
-│          │                          │                 │
-│  ┌───────┴──────────────────────────┴────────────┐   │
-│  │              Command Router                    │   │
-│  │  MQTT subscribe → parse → SDK call → respond  │   │
-│  └───────┬──────────────────────────┬────────────┘   │
-│          │                          │                 │
-│  ┌───────┴─────────┐    ┌──────────┴────────────┐   │
-│  │ Telemetry        │    │ Mission Manager        │   │
-│  │ Publisher         │    │ - Persist definitions  │   │
-│  │ - Flight 1Hz     │    │ - Translate JSON →     │   │
-│  │ - Battery 0.2Hz  │    │   DJIWaypointMission   │   │
-│  │ - Gimbal 1Hz     │    │ - Upload + execute     │   │
-│  │ - Camera onChange │    │ - Progress tracking    │   │
-│  │ - Signal 1Hz     │    │                        │   │
-│  └──────────────────┘    └────────────────────────┘   │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐    │
-│  │           Stream Manager                      │    │
-│  │  DJI LiveStreamManager → RTMP push            │    │
-│  │  - Auto-reconnect on stream failure           │    │
-│  │  - Report stream health via MQTT              │    │
-│  └──────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────┘
-```
-
-### 6.2 Key Design Decisions
-
-**Foreground Service:** The app runs as an Android Foreground Service with a persistent notification. This prevents the OS from killing it and ensures continuous operation.
-
-**Telemetry Throttling:** DJI SDK fires telemetry at 10 Hz. The bridge downsamples to 1 Hz for MQTT publishing (configurable). A "burst mode" at 10 Hz can be activated during active missions for higher fidelity tracking.
-
-**Mission Translation:** The bridge converts the JSON mission format (from MQTT retained messages) into `DJIMutableWaypointMission` objects. It validates against SDK constraints (99 waypoints, altitude limits) before upload.
-
-**MQTT Last Will:** The bridge sets an MQTT Last Will and Testament (LWT) of `"offline"` on `dji_hass/{drone_id}/state/connection`. On clean connect, it publishes `"online"`.
-
-**Configuration:** The bridge app has a minimal UI for initial setup only:
-- MQTT broker address/credentials
-- Drone ID
-- WiFi network selection
-- Then it runs headlessly as a service
-
-### 6.3 Hardware Requirements
-
-| Component | Purpose | Example |
-|-----------|---------|---------|
-| Android device | Run bridge app | Old phone (Android 7+), Xiaomi Mi Box, etc. |
-| USB OTG cable | Connect Android to RC | USB-C OTG or micro-USB OTG |
-| DJI Remote Controller | Bridge to aircraft | DJI RC for Mavic 2 |
-| WiFi network | Connect Android to HA network | Same LAN as HA |
-| Power supply | Keep Android device powered | USB charger (always plugged in) |
-
----
-
-## 7. Data Flow Diagrams
-
-### 7.1 Mission Execution Flow
-
-```
-User/Automation          HA Integration         MQTT Broker         Android Bridge        Mavic 2
-      │                       │                      │                     │                  │
-      │ service: execute      │                      │                     │                  │
-      │ mission "patrol_1"    │                      │                     │                  │
-      ├──────────────────────►│                      │                     │                  │
-      │                       │ PUB command/         │                     │                  │
-      │                       │ execute_mission      │                     │                  │
-      │                       ├─────────────────────►│                     │                  │
-      │                       │                      │ deliver             │                  │
-      │                       │                      ├────────────────────►│                  │
-      │                       │                      │                     │ load mission     │
-      │                       │                      │                     │ from cache       │
-      │                       │                      │                     │                  │
-      │                       │                      │                     │ validate         │
-      │                       │                      │                     │ (≤99 wps, etc.)  │
-      │                       │                      │                     │                  │
-      │                       │                      │                     │ SDK: loadMission │
-      │                       │                      │                     │ SDK: uploadMission
-      │                       │                      │                     ├─────────────────►│
-      │                       │                      │                     │                  │
-      │                       │                      │                     │ SDK: startMission│
-      │                       │                      │                     ├─────────────────►│
-      │                       │                      │                     │                  │
-      │                       │                      │  PUB response       │                  │
-      │                       │                      │◄────────────────────┤                  │
-      │                       │◄─────────────────────┤                     │                  │
-      │      success          │                      │                     │                  │
-      │◄──────────────────────┤                      │                     │                  │
-      │                       │                      │                     │                  │
-      │                       │                      │ PUB state/mission   │                  │
-      │                       │                      │ {status: executing, │                  │
-      │                       │                      │  progress: 0.15,    │                  │
-      │                       │◄─────────────────────│  waypoint: 2/12}    │                  │
-      │  entity updates       │                      │◄────────────────────┤  (ongoing)       │
-      │◄──────────────────────┤                      │                     │                  │
-```
-
-### 7.2 Video Streaming Flow
-
-```
-User/Automation          HA Integration         MQTT          Bridge           Media Server
-      │                       │                  │               │                   │
-      │ service: start_stream │                  │               │                   │
-      ├──────────────────────►│                  │               │                   │
-      │                       │ PUB command/     │               │                   │
-      │                       │ start_stream     │               │                   │
-      │                       ├─────────────────►│               │                   │
-      │                       │                  ├──────────────►│                   │
-      │                       │                  │               │                   │
-      │                       │                  │               │ SDK: setLiveUrl() │
-      │                       │                  │               │ SDK: startStream()│
-      │                       │                  │               │                   │
-      │                       │                  │               │ RTMP H.264 push   │
-      │                       │                  │               ├──────────────────►│
-      │                       │                  │               │   (continuous)    │
-      │                       │                  │               │                   │
-      │                       │                  │ PUB state/    │                   │
-      │                       │                  │ stream        │                   │
-      │                       │◄─────────────────│◄──────────────┤                   │
-      │                       │                  │               │                   │
-      │                       │ camera entity    │               │                   │
-      │                       │ stream_source =  │               │                   │
-      │  camera card shows    │ media_server_url │               │                   │
-      │  live video           │                  │               │                   │
-      │◄──────────────────────┤                  │               │                   │
-```
-
-### 7.3 Alarm-Triggered Automation Example
+### 9.5 Alarm-Triggered Automation (with Human Authorization)
 
 ```yaml
-# HA Automation: security_drone_patrol.yaml
 automation:
   - alias: "Drone Security Patrol on Alarm"
     trigger:
@@ -710,6 +679,7 @@ automation:
         entity_id: alarm_control_panel.home
         to: "triggered"
     condition:
+      # Safety gates
       - condition: state
         entity_id: binary_sensor.mavic2_connected
         state: "on"
@@ -719,86 +689,94 @@ automation:
       - condition: state
         entity_id: binary_sensor.mavic2_airborne
         state: "off"
+      - condition: state
+        entity_id: binary_sensor.dock_smoke
+        state: "off"
+      - condition: numeric_state
+        entity_id: sensor.dock_temperature
+        above: 5
+        below: 40
+      # Add weather integration checks (wind, rain) here
     action:
+      # Open dock lid
+      - service: cover.open_cover
+        entity_id: cover.drone_dock_lid
+      - wait_for_trigger:
+          - platform: state
+            entity_id: binary_sensor.dock_lid_open
+            to: "on"
+        timeout: "00:00:30"
+
+      # Actionable notification to RPIC (THE LEGAL COMPLIANCE STEP)
+      - service: notify.mobile_app_pilot_phone
+        data:
+          title: "Perimeter Alert"
+          message: >
+            Alarm triggered. Battery {{ states('sensor.mavic2_battery') }}%.
+            Wind OK. Dock open. Mission: full_perimeter.
+          data:
+            actions:
+              - action: "LAUNCH_DRONE"
+                title: "LAUNCH DRONE"
+              - action: "IGNORE"
+                title: "Ignore"
+
+      # Wait for pilot authorization (max 2 minutes)
+      - wait_for_trigger:
+          - platform: event
+            event_type: mobile_app_notification_action
+            event_data:
+              action: "LAUNCH_DRONE"
+        timeout: "00:02:00"
+        continue_on_timeout: false
+
+      # Pilot authorized — execute
       - service: dji_hass.start_stream
       - service: dji_hass.execute_mission
         data:
-          mission_id: "perimeter_sweep"
-      - service: notify.mobile_app
+          mission_id: "full_perimeter"
+
+      # Notify with live feed
+      - service: notify.mobile_app_pilot_phone
         data:
-          title: "Drone Patrol Activated"
-          message: "Alarm triggered. Drone executing perimeter sweep."
+          title: "Drone Airborne"
+          message: "Executing full perimeter sweep."
           data:
             image: "/api/camera_proxy/camera.mavic2_live"
+
+      # Wait for mission completion
       - wait_for_trigger:
           - platform: state
             entity_id: sensor.mavic2_mission_status
             to: "completed"
         timeout: "00:10:00"
+
+      # Cleanup
       - service: dji_hass.stop_stream
+      - delay: "00:00:30"
+      - service: cover.close_cover
+        entity_id: cover.drone_dock_lid
 ```
 
 ---
 
-## 8. Feature Feasibility Matrix
+## 10. Feature Feasibility Matrix
 
-Based on the original README proposal vs. DJI SDK v4 reality:
-
-| Proposed Feature | Feasible? | Implementation | Limitations |
-|------------------|-----------|----------------|-------------|
-| Execute predetermined mission | **Yes** | Waypoint missions via MSDK v4 | Max 99 waypoints per mission |
-| Stream video from drone | **Yes** | RTMP via LiveStreamManager → media server | 720p live (not 4K), RTMP only (no native RTSP) |
-| Record video | **Yes** | Camera API start/stop recording | Records at full resolution (4K) on SD card |
-| Take snapshots | **Yes** | Camera API shoot photo | Full resolution, RAW+JPEG supported |
-| Get flight status (airborne/landed) | **Yes** | FlightControllerState at 10 Hz | Rich data: mode, GPS, speed, heading, etc. |
-| Get battery level | **Yes** | Battery callback with full details | %, voltage, current, temp, cycles, remaining time |
+| Proposed Feature | Feasible? | How | Limitations |
+|------------------|-----------|-----|-------------|
+| Alarm-triggered mission | **Yes** | HA automation + RPIC tap | Requires human authorization (Part 107) |
+| Execute predetermined mission | **Yes** | Waypoint missions via MSDK v4 | Max 99 waypoints |
+| Stream video from drone | **Yes** | RTMP via LiveStreamManager → media server | 720p live (not 4K), RTMP only |
+| Record video | **Yes** | Camera API | 4K on SD card |
+| Take snapshots | **Yes** | Camera API | Full resolution RAW+JPEG |
+| Get flight status | **Yes** | FlightControllerState at 10 Hz | GPS, altitude, speed, heading, etc. |
+| Get battery level | **Yes** | Battery callback | %, voltage, current, temp, cycles |
 | Return to base | **Yes** | FlightController.startGoHome() | Configurable RTH altitude |
-| Trigger on HA alarm | **Yes** | Standard HA automation | Requires bridge online + drone connected + sufficient battery |
-| Notify with video | **Yes** | Camera entity + notification service | HA notification with camera snapshot or stream URL |
-| Persist video to storage | **Partial** | Recording on SD card (4K). RTMP can be recorded by media server (720p) | SD card download requires separate media retrieval step |
-| Cloud storage | **Partial** | Media server can push to cloud. SD card content needs manual or scheduled retrieval | Not real-time for 4K footage |
-| Control mission (start/abort) | **Yes** | Start/pause/resume/stop mission commands | Full lifecycle control |
-| Server-side (Linux) control | **No** | Requires Android/Windows bridge device | Fundamental SDK limitation |
-
----
-
-## 9. Alternative Architecture: RosettaDrone (Lower Effort)
-
-If building a custom Android app is too much initial effort, [RosettaDrone](https://github.com/RosettaDrone/rosettadrone) provides an existing MAVLink bridge:
-
-```
-[HA Integration]  ←UDP/MAVLink→  [RosettaDrone App]  ←USB→  [RC]  ←OcuSync→  [Mavic 2]
-                                      ↓
-                                 [RTP Video → FFmpeg → RTMP → Media Server]
-```
-
-**Pros:**
-- Already works with Mavic 2 Pro/Zoom
-- MAVLink is well-documented, Python libraries exist (pymavlink)
-- Video forwarding via RTP already implemented
-- Waypoint missions, telemetry, virtual stick all supported
-
-**Cons:**
-- MAVLink adds a translation layer (DJI → MAVLink → HA)
-- Less control over telemetry format and timing
-- RosettaDrone is community-maintained, may lag DJI SDK updates
-- Video path requires extra FFmpeg step for RTMP conversion
-
-**Recommendation:** Start with the custom MQTT bridge (Section 6). It's more work upfront but gives full control over the protocol, eliminates the MAVLink translation layer, and produces a cleaner HA integration. RosettaDrone is a valid fallback if the custom bridge proves too complex.
-
----
-
-## 10. Security Considerations
-
-| Concern | Mitigation |
-|---------|------------|
-| MQTT without TLS | Use MQTT over TLS (port 8883) in production. Mosquitto add-on supports TLS. |
-| Unauthorized drone commands | MQTT authentication required. Bridge validates command source. |
-| Physical access to bridge device | Bridge device should be in a secure location. Android device encryption enabled. |
-| DJI SDK credentials | DJI app key stored in Android Keystore, not in MQTT messages. |
-| Drone flyaway | Bridge enforces geofence validation before mission upload. RTH on signal loss is DJI default. |
-| Battery safety | Bridge refuses mission execution below configurable battery threshold (default 30%). |
-| Network isolation | Bridge and HA should be on a dedicated VLAN/WiFi, not guest network. |
+| Notify with video | **Yes** | Camera entity + notification | Snapshot or stream URL |
+| Physical dock | **Yes** | Custom NEMA enclosure + ESPHome | Manual battery rotation still required |
+| Auto battery charging | **No** | Mavic 2 cannot charge in-aircraft | External charger on smart outlet only |
+| Fully autonomous launch | **No** | FAA Part 107 prohibits it | Human-in-the-loop required |
+| Server-side control | **No** | No Linux SDK for Mavic 2 | Android bridge required |
 
 ---
 
@@ -806,97 +784,194 @@ If building a custom Android app is too much initial effort, [RosettaDrone](http
 
 | Failure | Detection | Recovery |
 |---------|-----------|----------|
-| Bridge loses WiFi | MQTT LWT triggers "offline" | HA marks drone unavailable. Bridge auto-reconnects. Drone continues mission or RTH per DJI failsafe. |
-| Bridge app crashes | MQTT LWT triggers "offline" | Android restarts foreground service (auto-restart). DJI failsafe handles drone. |
-| RC disconnects from drone | SDK product disconnect callback | Bridge publishes "offline". Drone auto-RTH (DJI failsafe). |
-| RC disconnects from Android | SDK callback | Bridge publishes "offline". Drone continues mission if in progress, then auto-RTH. |
-| MQTT broker down | Bridge reconnect loop | Commands blocked. Telemetry buffered briefly then dropped. Drone unaffected. |
-| Media server down | Stream error callback | Bridge stops RTMP push. Retries periodically. Drone flight unaffected. |
-| Mission upload fails | SDK error callback | Bridge publishes error response. HA shows error. Drone stays on ground. |
-| Low battery during mission | DJI auto-RTH at critical battery | Bridge publishes battery warning. DJI firmware handles safety. |
-| GPS loss during mission | DJI switches to ATTI mode | Bridge publishes flight_mode change. Mission may be interrupted by DJI firmware. |
+| Bridge loses WiFi | MQTT LWT → "offline" | HA marks unavailable. Bridge auto-reconnects. DJI failsafe handles drone. |
+| Bridge app crash | MQTT LWT → "offline" | Android auto-restarts foreground service. |
+| RC disconnects from drone | SDK callback | Bridge publishes "offline". Drone auto-RTH (DJI failsafe). |
+| RC disconnects from Android | SDK callback | Bridge publishes "offline". Drone RTH if in mission. |
+| MQTT broker down | Bridge reconnect loop | Commands blocked. Drone unaffected. |
+| Media server down | Stream error callback | Stream stops. Flight unaffected. |
+| Mission upload fails | SDK error → MQTT response | HA shows error. Drone stays on ground. |
+| Low battery during mission | DJI auto-RTH at critical % | DJI firmware handles safety. |
+| GPS loss during mission | DJI → ATTI mode | Bridge publishes mode change. DJI firmware may interrupt mission. |
+| Dock lid actuator stuck | Motion timeout on ESP32 | Controller flags fault. HA alerts pilot. |
+| Dock smoke sensor triggered | ESP32 hardware interlock | Charger power cut immediately (hardware relay). HA alerts. |
+| Power outage | UPS → sensor reports | Dock remains closed. System unavailable until power restored. |
+| Pilot doesn't authorize in time | 2-minute timeout in automation | Mission not launched. Event logged. |
 
 ---
 
-## 12. Implementation Plan
+## 12. Security Considerations
 
-### Phase 1: Android Bridge MVP (Weeks 1-3)
+| Concern | Mitigation |
+|---------|------------|
+| MQTT without TLS | Use MQTT over TLS (port 8883) in production |
+| Unauthorized drone commands | MQTT authentication. Bridge validates command source. |
+| Physical access to bridge device | Secure location. Android device encryption. |
+| DJI SDK credentials | Android Keystore, not in MQTT messages |
+| Drone flyaway | Bridge enforces geofence before mission upload. RTH on signal loss (DJI default). |
+| Battery safety | Bridge refuses mission below configurable threshold (default 30%). Dock smoke sensor. |
+| Network isolation | Dedicated VLAN/WiFi for bridge + HA |
+| Privacy (neighbors) | Missions avoid neighbor airspace. Camera angle constrained. |
+| Audit trail | HA logs: trigger, authorization timestamp, mission, outcome |
 
-1. Android project setup with DJI Mobile SDK v4
-2. SDK registration and product connection handling
-3. MQTT client (Eclipse Paho) with connection management and LWT
-4. Telemetry publishing (flight, battery)
-5. Basic commands: takeoff, land, RTH
-6. Foreground service with auto-restart
+---
 
-**Deliverable:** Bridge that connects to Mavic 2, publishes telemetry, accepts takeoff/land/RTH.
+## 13. Platform Migration Strategy
 
-### Phase 2: HA Integration MVP (Weeks 2-4)
+### 13.1 The Mavic 2 Problem
 
-1. Custom component scaffold (`custom_components/dji_hass/`)
-2. Config flow (MQTT connection + drone discovery)
-3. MQTT coordinator (subscribe, parse, maintain state)
-4. Sensor entities (battery, altitude, speed, flight mode)
-5. Binary sensor entities (connected, airborne)
-6. Service handlers (takeoff, land, RTH)
+The Mavic 2 is an aging platform (2018). Batteries degrade and will become harder to procure. Third-party batteries are the highest failure item in unattended deployments.
 
-**Deliverable:** Working HA integration showing drone telemetry and accepting basic flight commands.
+**Mavic 2 is explicitly Phase-0 hardware.** It validates:
+- Mission geometry and corridor safety
+- HA integration and automation workflow
+- Dock mechanics and environmental control
+- Operational discipline and battery management
+- Response time and VLOS reliability
 
-### Phase 3: Missions (Weeks 4-6)
+### 13.2 Aircraft-Agnostic Dock Design
 
-1. Bridge: Mission definition parsing (JSON → DJIWaypointMission)
-2. Bridge: Mission upload, execute, pause, resume, stop
+The dock is designed around **interfaces, not the drone**:
+
+| Abstraction | What Changes on Upgrade |
+|-------------|------------------------|
+| Landing pad geometry | Adjustable alignment guides |
+| Battery charging | Swap charger on smart outlet |
+| MQTT topics | Same protocol, new `drone_id` |
+| Mission definitions | Same JSON format, new waypoints |
+| Android bridge app | Rebuild with new DJI SDK version |
+| HA integration | Unchanged (MQTT abstraction) |
+
+### 13.3 Future Platform Candidates
+
+| Platform | Strengths | Notes |
+|----------|-----------|-------|
+| DJI Air 3/3S | Current production, long flight time (~40 min), good obstacle sensing, available batteries | Consumer firmware constraints, no dock ecosystem |
+| DJI Mavic 3 Enterprise | Enterprise lifecycle, supported SDK, future dock compatibility | Significantly higher cost |
+| DJI Dock 2 ecosystem | Solves all hardware problems | $15k-30k total cost, likely overkill for 1-acre residential |
+
+### 13.4 Decision Threshold
+
+Consider upgrading to an enterprise system only if you need:
+- Zero human battery handling
+- Multiple flights per hour
+- Unattended overnight patrol loops
+- BVLOS waiver pathway
+
+Otherwise the DIY system achieves ~85% of enterprise capability at ~15-20% of the cost.
+
+---
+
+## 14. Implementation Plan
+
+### Phase 0: Site Survey + Mission Geometry (1 day)
+1. Map obstacles: tallest trees, canopy extents, no-fly wedges
+2. Identify clear takeoff/landing cylinder above shed roof
+3. Verify clear approach lane (no branches in RTH direction)
+4. Define 2-3 mission corridors that stay visible from pilot position
+5. Fly test missions manually, validate altitude/speed/camera angle
+6. **Deliverable:** Property mission map + dock location decision
+
+### Phase 1: Minimal Dock (2 weekends)
+1. Source NEMA 4X enclosure + lid material
+2. Install ESPHome ESP32 with temp/humidity/smoke sensors
+3. Install linear actuator + limit switches
+4. Wire power (UPS + fused rails)
+5. Configure ESPHome entities in HA
+6. Test lid open/close cycle, interlock logic
+7. **Deliverable:** Drone can live outdoors safely, lid controlled from HA
+
+### Phase 2: Android Bridge MVP (Weeks 1-3)
+1. Android project + DJI Mobile SDK v4 setup
+2. SDK registration + product connection handling
+3. MQTT client (Paho) + LWT + telemetry publishing
+4. Basic commands: takeoff, land, RTH
+5. Foreground service with auto-restart
+6. **Deliverable:** Bridge publishes telemetry, accepts flight commands
+
+### Phase 3: HA Integration MVP (Weeks 2-4)
+1. `custom_components/dji_hass/` scaffold
+2. Config flow (MQTT + drone discovery)
+3. MQTT coordinator
+4. Sensor + binary sensor entities
+5. Service handlers (takeoff, land, RTH)
+6. **Deliverable:** Drone telemetry in HA, basic commands work
+
+### Phase 4: Missions (Weeks 4-6)
+1. Bridge: JSON → DJIWaypointMission translation
+2. Bridge: Upload, execute, pause, resume, stop
 3. Bridge: Mission progress reporting
-4. HA: Mission entity, service handlers, progress tracking
-5. HA: Mission definition UI or YAML config
+4. HA: Mission services + progress entity
+5. Build actual perimeter mission pack for the property
+6. **Deliverable:** Waypoint missions from HA
 
-**Deliverable:** Waypoint missions can be defined, uploaded, and executed from HA.
+### Phase 5: Video + Camera (Weeks 5-7)
+1. Bridge: RTMP push via LiveStreamManager
+2. Media server setup (go2rtc or mediamtx)
+3. HA: Camera entity
+4. Bridge: Camera control (photo, record) + gimbal
+5. HA: Camera + gimbal services
+6. **Deliverable:** Live 720p video in HA dashboard, photo/video capture
 
-### Phase 4: Video (Weeks 5-7)
+### Phase 6: Full Workflow Integration (Weeks 7-9)
+1. Alarm → safety gates → notification → authorization automation
+2. Dock integration (open lid before launch, close after land)
+3. Battery maintenance automations
+4. Audit logging
+5. Multi-drone support (Zoom primary, Pro secondary)
+6. **Deliverable:** End-to-end alarm response workflow
 
-1. Bridge: LiveStreamManager RTMP push
-2. Bridge: Stream start/stop commands, health reporting
-3. Media server setup (mediamtx or go2rtc add-on)
-4. HA: Camera entity consuming media server stream
-5. HA: Stream control services
-
-**Deliverable:** Live 720p video from drone viewable in HA dashboard.
-
-### Phase 5: Camera & Gimbal (Weeks 6-8)
-
-1. Bridge: Camera control (photo, record, settings)
-2. Bridge: Gimbal control (pitch, reset)
-3. HA: Camera services (take_photo, start/stop_recording)
-4. HA: Gimbal service (set_gimbal)
-5. Integration with mission waypoint actions
-
-**Deliverable:** Full camera and gimbal control from HA.
-
-### Phase 6: Hardening (Weeks 8-10)
-
-1. Comprehensive error handling and edge cases
-2. Battery safety thresholds
-3. Geofence validation
+### Phase 7: Hardening (Weeks 9-11)
+1. Edge case handling (all failure modes in Section 11)
+2. Battery safety thresholds in bridge
+3. Geofence validation before mission upload
 4. MQTT TLS
 5. HA integration tests (pytest)
-6. Bridge integration tests
-7. Documentation
-
-**Deliverable:** Production-ready integration with safety checks and test coverage.
+6. Operational rehearsals (day/night, wind, rain)
+7. **Deliverable:** System you trust at 3 AM in winter rain
 
 ---
 
-## 13. Open Questions
+## 15. Cost Estimate
 
-1. **ChatGPT conversation:** The shared link (titled "Drone Mission Regulations WA") could not be accessed — it requires ChatGPT authentication. If it contains additional requirements (e.g., Washington state geofencing, specific regulation handling), those should be incorporated.
+### DIY System (this design)
 
-2. **Multi-drone support:** Should the architecture support multiple drones? Current design supports it (drone_id in topics) but would need multiple bridge devices.
+| Component | Estimated Cost |
+|-----------|---------------|
+| Weatherproof enclosure + lid | $300-900 |
+| Heating + ventilation | $150-400 |
+| Sensors (temp, humidity, smoke, rain) | $150-300 |
+| Smart power + UPS | $300-800 |
+| Lid actuator + mechanism | $200-600 |
+| Landing pad + alignment | $100-300 |
+| Spare batteries (6-8 total, 3 per drone) | $800-1,600 |
+| ESP32 + wiring + misc | $100-200 |
+| Android device (old phone) | $0-150 |
+| Anti-collision strobe | $30-80 |
+| Misc fabrication | $300-800 |
+| **Total** | **$2,500-6,000** |
 
-3. **SD card media retrieval:** Should the integration support downloading photos/videos from the drone's SD card to HA storage? This is possible via MSDK v4 MediaManager but adds significant complexity.
+### vs. DJI Dock 2 Enterprise
 
-4. **Mission editor:** Should missions be defined via HA UI (map-based editor), YAML files, or imported from DJI tools? A map-based editor is a substantial frontend effort.
+| Item | Cost |
+|------|------|
+| DJI Dock 2 + Matrice 3TD bundle | $15,000-17,000 |
+| Installation + mounting | $1,000-5,000 |
+| Enterprise batteries | $300-700 each |
+| LTE / networking | $10-40/month |
+| FlightHub subscription | Variable |
+| **Total (3-year)** | **$20,000-40,000** |
 
-5. **Virtual stick mode:** Should we expose low-level virtual stick control as an HA service, or restrict to waypoint missions only? Virtual stick is powerful but dangerous without safeguards.
+---
+
+## 16. Open Questions
+
+1. **Multi-drone operations:** Two drones, one dock, or two docks? Rotation strategy?
+2. **SD card media retrieval:** Automate downloading 4K footage from SD to HA/NAS? (MSDK v4 MediaManager supports it, but adds complexity.)
+3. **Mission editor:** Define missions via HA UI (map), YAML, or import from DJI tools?
+4. **Virtual stick:** Expose low-level control as HA service? Powerful but dangerous.
+5. **Remote ID module:** Which module for Mavic 2? Firmware-enabled or external?
+6. **Weather integration:** Which HA weather integration for wind/rain gating? Local anemometer vs. API?
 
 ---
 
@@ -909,4 +984,4 @@ If building a custom Android app is too much initial effort, [RosettaDrone](http
 - [DJI Cloud API MQTT](https://developer.dji.com/doc/cloud-api-tutorial/en/overview/basic-concept/mqtt.html)
 - [DJI Windows SDK](https://developer.dji.com/windows-sdk/)
 - [RosettaDrone (GitHub)](https://github.com/RosettaDrone/rosettadrone)
-- [DJI Cloud API Supported Devices](https://deepwiki.com/dji-sdk/Cloud-API-Doc/9.1-supported-devices)
+- [14 CFR Part 107](https://www.ecfr.gov/current/title-14/chapter-I/subchapter-F/part-107)
